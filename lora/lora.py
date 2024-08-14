@@ -11,9 +11,12 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
 import utils as lora_utils
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 from models import LoRALinear
-
+import pandas as pd
+import os
+import numpy as np
+from tqdm import tqdm
 
 def build_parser():
     parser = argparse.ArgumentParser(description="LoRA or QLoRA finetuning.")
@@ -120,6 +123,10 @@ def build_parser():
         help="Number of test set batches, -1 uses the entire test set.",
     )
     parser.add_argument("--seed", type=int, default=0, help="The PRNG seed")
+
+    parser.add_argument('--losses-csv', type=str, default='losses.csv', help='The losses CSV (will be saved to the adapter output directory')
+    parser.add_argument('--max-example-length', type=int, default=-1, help='The maximum example length in tokens (set to -1 to ignore)')
+    
     return parser
 
 
@@ -185,7 +192,7 @@ def loss(model, inputs, targets, lengths):
     return ce, ntoks
 
 
-def iterate_batches(dset, tokenizer, batch_size, train=False):
+def iterate_batches(dset, tokenizer, batch_size, args, train=False):
     # Shuffle indices
     while True:
         indices = np.arange(len(dset))
@@ -195,7 +202,15 @@ def iterate_batches(dset, tokenizer, batch_size, train=False):
         # Collect batches from dataset
         for i in range(0, len(indices) - batch_size + 1, batch_size):
             # Encode batch
-            batch = [tokenizer.encode(dset[indices[i + j]]) for j in range(batch_size)]
+            batch = []
+            for j in range(batch_size):
+                cur_example = tokenizer.encode(dset[indices[i + j]])
+                if args.max_example_length > 0 and len(cur_example) > args.max_example_length:
+                    start_id = np.random.randint(low=0, high=len(cur_example) - args.max_example_length)
+                    cur_example = cur_example[start_id : start_id + args.max_example_length]
+                batch.append(cur_example)
+                    
+            #batch = [tokenizer.encode(dset[indices[i + j]]) for j in range(batch_size)]
             lengths = [len(x) for x in batch]
 
             # Check if any sequence is longer than 2048 tokens
@@ -226,7 +241,7 @@ def evaluate(model, dataset, loss, tokenizer, batch_size, num_batches):
 
     for it, batch in zip(
         index_iterator,
-        iterate_batches(dataset, tokenizer, batch_size),
+        iterate_batches(dataset, tokenizer, batch_size, args=args),
     ):
         losses, toks = loss(model, *batch)
         all_losses.append((losses * toks).item())
@@ -239,62 +254,73 @@ def train(model, train_set, val_set, optimizer, loss, tokenizer, args):
     # Create value and grad function for loss
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
+    losses_df = None
+    
     losses = []
     n_tokens = 0
 
     # Main training loop
     start = time.perf_counter()
+    pbar = tqdm(total=args.iters)
+    losses10 = []
+    losses50 = []
+    total_tokens = 0
     for it, batch in zip(
         range(args.iters),
-        iterate_batches(train_set, tokenizer, args.batch_size, train=True),
+        iterate_batches(train_set, tokenizer, args.batch_size, train=True, args=args),
     ):
+        
         # Forward and backward pass
         (lvalue, toks), grad = loss_value_and_grad(model, *batch)
 
-        # Model update
         optimizer.update(model, grad)
         mx.eval(model.parameters(), optimizer.state, lvalue)
 
         # Record loss
         losses.append(lvalue.item())
-        n_tokens += toks.item()
+        total_tokens += toks.item()
 
+        # Record loss (Pandas)
+        cur_df = pd.DataFrame(
+            {
+                'iter': [it],
+                'loss': [lvalue.item()],
+                'tokens': [total_tokens]
+            },
+            index=[it]
+        )
+
+        if len(losses10) == 10:
+            losses10 = losses10[1:-1]
+        if len(losses50) == 50:
+            losses50 = losses50[1:-1]
+        losses10.append(lvalue.item())
+        losses50.append(lvalue.item())
+        last10 = sum(losses10) / len(losses10)
+        last50 = sum(losses50) / len(losses50)
+        
         # Report training loss if needed
-        if (it + 1) % args.steps_per_report == 0:
-            train_loss = np.mean(losses)
+        pbar.set_description(
+            f'Batch loss: {np.around(lvalue.item(), 3)} Last-10 loss: {np.around(last10, 3)} Last-50 loss: {np.around(last50, 3)} Total tokens: {np.around(total_tokens / 1e6, 1)}M'
+        )
+        pbar.update(1)
 
-            stop = time.perf_counter()
-            print(
-                f"Iter {it + 1}: Train loss {train_loss:.3f}, "
-                f"It/sec {args.steps_per_report / (stop - start):.3f}, "
-                f"Tokens/sec {float(n_tokens) / (stop - start):.3f}"
-            )
-            losses = []
-            n_tokens = 0
-            start = time.perf_counter()
+        losses_df = pd.concat([losses_df, cur_df])
 
-        # Report validation loss if needed
-        if it == 0 or (it + 1) % args.steps_per_eval == 0:
-            stop = time.perf_counter()
-            val_loss = evaluate(
-                model, val_set, loss, tokenizer, args.batch_size, args.val_batches
-            )
-            print(
-                f"Iter {it + 1}: "
-                f"Val loss {val_loss:.3f}, "
-                f"Val took {(time.perf_counter() - stop):.3f}s"
-            )
-
-            start = time.perf_counter()
+        # write global loss to CSV
+        losses_path = os.path.join(os.path.dirname(args.adapter_file), args.losses_csv)
+        losses_df.to_csv(losses_path, index=False)
 
         # Save adapter weights if needed
-        if (it + 1) % args.save_every == 0:
+        if (it  + 1) % args.save_every == 0:
+            save_path = args.adapter_file.replace('.npz', f'-{np.around(total_tokens / 1e6, 1)}M.npz')
             mx.savez(
-                args.adapter_file, **dict(tree_flatten(model.trainable_parameters()))
+                save_path, **dict(tree_flatten(model.trainable_parameters()))
             )
-            print(f"Iter {it + 1}: Saved adapter weights to {args.adapter_file}.")
 
 
+    pbar.close()
+            
 def generate(model, prompt, tokenizer, args):
     print(prompt, end="", flush=True)
 
@@ -334,6 +360,7 @@ if __name__ == "__main__":
 
     print("Loading pretrained model")
     model, tokenizer, _ = lora_utils.load(args.model, tokenizer_config)
+    gmodel = model
     # Freeze all layers other than LORA linears
     model.freeze()
     for l in model.model.layers[len(model.model.layers) - args.lora_layers :]:
